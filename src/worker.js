@@ -1,0 +1,1115 @@
+/* attP / attB Finder Worker
+   Optimized for large host GenBank files by parsing only host tRNA/tmRNA features.
+*/
+function postLog(message) { self.postMessage({ type: 'log', message }); }
+function rc(seq) {
+  const out = new Array(seq.length);
+  for (let i = seq.length - 1, j = 0; i >= 0; i--, j++) {
+    const b = seq[i];
+    out[j] = b === 'A' ? 'T' : b === 'T' ? 'A' : b === 'G' ? 'C' : b === 'C' ? 'G' : 'N';
+  }
+  return out.join('');
+}
+function cleanSeq(s) { return (s || '').replace(/[^A-Za-z]/g, '').toUpperCase().replace(/U/g, 'T').replace(/[^ACGTN]/g, 'N'); }
+function isLowComplexity(seq) {
+  const s = String(seq || '').toUpperCase().replace(/N/g, '');
+  if (s.length < 6) return false;
+  const counts = { A: 0, C: 0, G: 0, T: 0 };
+  for (const b of s) if (counts[b] !== undefined) counts[b]++;
+  const maxBase = Math.max(...Object.values(counts));
+  if (maxBase / s.length >= 0.76) return true;
+  if (/^(..)+$/.test(s)) {
+    const unit = s.slice(0, 2);
+    if (unit.repeat(Math.floor(s.length / 2)) === s) return true;
+  }
+  return false;
+}
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function fmt(n) { return Number.isFinite(n) ? n.toLocaleString() : ''; }
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+  return `${(n/1024/1024).toFixed(1)} MB`;
+}
+
+const HOST_CORE_FEATURE_TYPES = new Set(['tRNA', 'tmRNA', 'rRNA']);
+const HOST_CDS_FEATURE_TYPES = new Set(['CDS', 'gene']);
+
+function boolSetting(settings, key, fallback=true) {
+  return settings && Object.prototype.hasOwnProperty.call(settings, key) ? !!settings[key] : fallback;
+}
+
+function numericSetting(settings, key, fallback, lo=null, hi=null) {
+  let value = Number(settings?.[key]);
+  if (!Number.isFinite(value)) value = fallback;
+  if (lo !== null) value = Math.max(lo, value);
+  if (hi !== null) value = Math.min(hi, value);
+  return value;
+}
+
+function integraseFamilyMode(settings) {
+  const mode = String(settings?.integraseFamilyMode || 'auto').toLowerCase();
+  return ['auto', 'serine', 'tyrosine', 'unknown'].includes(mode) ? mode : 'auto';
+}
+
+function effectiveIntegraseFamily(inferredFamily, settings) {
+  const mode = integraseFamilyMode(settings);
+  if (mode === 'serine' || mode === 'tyrosine') return mode;
+  if (mode === 'unknown') return 'unknown';
+  return ['serine', 'tyrosine'].includes(inferredFamily) ? inferredFamily : 'unknown';
+}
+
+function effectiveIntegraseFamilySource(inferredFamily, settings) {
+  const mode = integraseFamilyMode(settings);
+  const inferred = ['serine', 'tyrosine'].includes(inferredFamily) ? inferredFamily : 'unknown';
+  if (mode === 'serine' || mode === 'tyrosine') return inferred !== 'unknown' && inferred !== mode ? `user_selected_over_${inferred}` : 'user_selected';
+  if (mode === 'unknown') return 'user_selected_unknown';
+  return inferred === 'unknown' ? 'auto_unresolved' : 'auto_annotation';
+}
+
+function isKnownIntegraseFamily(family) {
+  return family === 'serine' || family === 'tyrosine';
+}
+
+function isCanonicalHostFeatureClass(featureClass, searchType='') {
+  return ['tRNA', 'tmRNA', 'rRNA'].includes(featureClass) || ['tRNA', 'tmRNA', 'rRNA'].includes(searchType);
+}
+
+function isSerineCdsHostFeatureClass(featureClass, searchType='') {
+  return String(featureClass || '').startsWith('CDS_hotspot') || searchType === 'CDS_hotspot';
+}
+
+function hasStrongOffModelExactEvidence(core, settings) {
+  const rescueMin = numericSetting(settings, 'offModelExactCoreMin', 26, 18, 60);
+  return core && core.matchModel === 'exact_core' && core.len >= rescueMin;
+}
+
+function assessFamilyModelFit(core, opts, settings) {
+  const family = opts.integraseFamily || 'unknown';
+  const featureClass = opts.hostFeatureClass || '';
+  const searchType = opts.searchType || '';
+  const filtering = boolSetting(settings, 'filterByIntegraseType', true);
+  if (!filtering || !isKnownIntegraseFamily(family)) return { fit: 'not_applied', offModel: false, reason: '' };
+
+  const canonical = isCanonicalHostFeatureClass(featureClass, searchType);
+  const serineCds = isSerineCdsHostFeatureClass(featureClass, searchType);
+  const strongExact = hasStrongOffModelExactEvidence(core, settings);
+  const model = core?.matchModel || 'exact_core';
+
+  if (family === 'serine') {
+    if (serineCds) return { fit: 'on_model', offModel: false, reason: 'known serine integrase: CDS hotspot target is expected' };
+    if (!canonical && model === 'serine_stem_core') return { fit: 'on_model', offModel: false, reason: 'known serine integrase: small-core/stem pattern is expected' };
+    if (canonical && !strongExact) return { fit: 'off_model', offModel: true, reason: 'known serine integrase: tRNA/tmRNA/rRNA hit suppressed unless exact core is unusually strong' };
+    if (canonical && strongExact) return { fit: 'off_model_rescued', offModel: false, reason: 'known serine integrase: canonical RNA locus retained only because exact-core evidence is strong' };
+    return { fit: 'neutral', offModel: false, reason: 'known serine integrase: non-canonical locus retained for sequence evidence' };
+  }
+
+  if (family === 'tyrosine') {
+    if (canonical) return { fit: 'on_model', offModel: false, reason: 'known tyrosine integrase: tRNA/tmRNA/rRNA-proximal target is expected' };
+    if ((serineCds || model === 'serine_stem_core') && !strongExact) return { fit: 'off_model', offModel: true, reason: 'known tyrosine integrase: serine-CDS/stem-style hit suppressed unless exact core is unusually strong' };
+    if ((serineCds || model === 'serine_stem_core') && strongExact) return { fit: 'off_model_rescued', offModel: false, reason: 'known tyrosine integrase: off-model locus retained only because exact-core evidence is strong' };
+    return { fit: 'neutral', offModel: false, reason: 'known tyrosine integrase: non-canonical locus retained for sequence evidence' };
+  }
+
+  return { fit: 'not_applied', offModel: false, reason: '' };
+}
+
+function shouldSearchFeatureTarget(targetLike, settings, family) {
+  if (!boolSetting(settings, 'filterByIntegraseType', true)) return true;
+  if (boolSetting(settings, 'showOffModelCandidates', false)) return true;
+  if (!isKnownIntegraseFamily(family)) return true;
+  const type = targetLike?.featureType || targetLike?.type || targetLike?.featureMeta?.type || '';
+  const label = targetLike?.product || targetLike?.label || targetLike?.featureMeta?.label || '';
+  const cls = targetLike?.featureClass || targetLike?.featureMeta?.featureClass || hostFeatureClassFromText({ type, label }).className;
+  if (family === 'serine') return isSerineCdsHostFeatureClass(cls, type);
+  if (family === 'tyrosine') return isCanonicalHostFeatureClass(cls, type);
+  return true;
+}
+
+function parseFasta(text, fileName) {
+  const records = [];
+  let header = fileName, seqParts = [];
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith('>')) {
+      if (seqParts.length) records.push({ name: header, fileName, sequence: cleanSeq(seqParts.join('')), features: [], format: 'FASTA' });
+      header = line.slice(1).trim() || fileName;
+      seqParts = [];
+    } else {
+      seqParts.push(line.trim());
+    }
+  }
+  if (seqParts.length) records.push({ name: header, fileName, sequence: cleanSeq(seqParts.join('')), features: [], format: 'FASTA' });
+  if (!records.length) records.push({ name: fileName, fileName, sequence: cleanSeq(text), features: [], format: 'FASTA' });
+  return records;
+}
+
+function splitGenBankRecords(text) {
+  const parts = text.split(/^\/\/\s*$/m).map(x => x.trim()).filter(Boolean);
+  return parts.length ? parts : [text];
+}
+
+function getNameFromRecord(rec, fileName) {
+  const locusMatch = rec.match(/^LOCUS\s+(\S+)/m);
+  if (locusMatch) return locusMatch[1];
+  const defMatch = rec.match(/^DEFINITION\s+([\s\S]*?)(?=^ACCESSION\s|^VERSION\s|^KEYWORDS\s|^SOURCE\s)/m);
+  return defMatch?.[1]?.replace(/\s+/g, ' ').trim() || fileName;
+}
+
+function extractOrigin(rec) {
+  const originMatch = rec.match(/^ORIGIN\b/m);
+  if (!originMatch) return '';
+  const originStart = originMatch.index + originMatch[0].length;
+  let originText = rec.slice(originStart);
+  const end = originText.search(/^\/\//m);
+  if (end >= 0) originText = originText.slice(0, end);
+  return cleanSeq(originText);
+}
+
+function extractFeaturesBlock(rec) {
+  const featuresMatch = rec.match(/^FEATURES\s+Location\/Qualifiers/m);
+  if (!featuresMatch) return '';
+  const start = featuresMatch.index + featuresMatch[0].length;
+  const after = rec.slice(start);
+  const endMatch = after.search(/^ORIGIN|^CONTIG|^BASE COUNT|^REFERENCE|^COMMENT|^SOURCE|^\/\//m);
+  return endMatch >= 0 ? after.slice(0, endMatch) : after;
+}
+
+function parseGenBank(text, fileName, role) {
+  const records = [];
+  const keepTypes = role === 'host' ? new Set(['tRNA', 'tmRNA', 'rRNA', 'CDS', 'gene']) : new Set(['CDS', 'tRNA', 'tmRNA', 'rRNA']);
+  for (const rec of splitGenBankRecords(text)) {
+    const name = getNameFromRecord(rec, fileName);
+    const sequence = extractOrigin(rec);
+    if (!sequence) continue;
+    const block = extractFeaturesBlock(rec);
+    const features = parseFeaturesFiltered(block, keepTypes);
+    records.push({ name, fileName, sequence, features, format: 'GenBank' });
+  }
+  return records;
+}
+
+function parseFeaturesFiltered(block, keepTypes) {
+  const lines = block.split(/\r?\n/);
+  const features = [];
+  let current = null;
+  let keep = false;
+  for (const line of lines) {
+    const start = line.match(/^\s{5}(\S+)\s+(.+)/);
+    if (start) {
+      if (current && keep) features.push(finalizeFeature(current));
+      keep = keepTypes.has(start[1]);
+      current = keep ? { type: start[1], locationRaw: start[2].trim(), qualifiersRaw: [] } : null;
+      continue;
+    }
+    if (!current || !keep) continue;
+    const cont = line.length > 21 ? line.slice(21).trim() : '';
+    if (!cont) continue;
+    if (cont.startsWith('/')) current.qualifiersRaw.push(cont);
+    else if (current.qualifiersRaw.length && !cont.match(/^[a-zA-Z_]+\(/) && !cont.match(/^[<>]?\d/)) current.qualifiersRaw[current.qualifiersRaw.length - 1] += ' ' + cont;
+    else current.locationRaw += cont;
+  }
+  if (current && keep) features.push(finalizeFeature(current));
+  return features;
+}
+
+function finalizeFeature(f) {
+  const qualifiers = {};
+  for (const q of f.qualifiersRaw) {
+    const m = q.match(/^\/(\S+?)(?:=(.*))?$/);
+    if (!m) continue;
+    let val = m[2] || true;
+    if (typeof val === 'string') val = val.replace(/^"|"$/g, '').replace(/"\s+"/g, ' ');
+    if (qualifiers[m[1]]) {
+      if (!Array.isArray(qualifiers[m[1]])) qualifiers[m[1]] = [qualifiers[m[1]]];
+      qualifiers[m[1]].push(val);
+    } else qualifiers[m[1]] = val;
+  }
+  const loc = parseLocation(f.locationRaw);
+  return { type: f.type, locationRaw: f.locationRaw, qualifiers, ...loc };
+}
+
+function parseLocation(raw) {
+  let s = raw.replace(/\s+/g, '');
+  let strand = '+';
+  if (s.startsWith('complement(') && s.endsWith(')')) {
+    strand = '-';
+    s = s.slice(11, -1);
+  }
+  if (s.startsWith('join(') && s.endsWith(')')) s = s.slice(5, -1);
+  s = s.replace(/complement\(|join\(|\)/g, '');
+  const nums = [...s.matchAll(/<?(\d+)\.\.>?(\d+)|<?(\d+)/g)].map(m => [Number(m[1] || m[3]), Number(m[2] || m[3])]);
+  if (!nums.length) return { start: null, end: null, strand, parts: [] };
+  const start = Math.min(...nums.map(p => Math.min(p[0], p[1])));
+  const end = Math.max(...nums.map(p => Math.max(p[0], p[1])));
+  return { start, end, strand, parts: nums };
+}
+
+function qualValue(feature, key) {
+  const q = feature.qualifiers || {};
+  const v = q[key];
+  if (Array.isArray(v)) return v.join(' ');
+  return String(v || '');
+}
+
+function qualText(feature) {
+  return ['gene', 'product', 'note', 'function', 'locus_tag', 'standard_name'].map(k => qualValue(feature, k)).join(' ');
+}
+
+function normalizedFeatureText(feature) {
+  return `${feature?.type || ''} ${qualText(feature || {})}`.toLowerCase().replace(/[_-]+/g, ' ');
+}
+
+function inferIntegraseFamily(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\bserine[-\s]?(family\s+)?(site[-\s]?specific\s+)?(integrase|recombinase|resolvase)\b/.test(t) ||
+      /\b(integrase|recombinase|resolvase)[-\s]?(family\s+)?serine\b/.test(t) ||
+      /\btransposon[-\s]?resolvase\b/.test(t)) return 'serine';
+  if (/\btyrosine[-\s]?(family\s+)?(site[-\s]?specific\s+)?(integrase|recombinase)\b/.test(t) ||
+      /\b(integrase|recombinase)[-\s]?(family\s+)?tyrosine\b/.test(t) ||
+      /\blambda[-\s]?like\b/.test(t)) return 'tyrosine';
+  return 'unknown';
+}
+
+function hostFeatureClassFromText(featureOrMeta) {
+  const type = String(featureOrMeta?.type || featureOrMeta?.featureType || '').trim();
+  const label = String(featureOrMeta?.label || featureProduct(featureOrMeta) || featureOrMeta?.product || '').toLowerCase().replace(/[_-]+/g, ' ');
+  const text = `${type} ${label}`.toLowerCase().replace(/[_-]+/g, ' ');
+  if (/^trna$/i.test(type)) return { className: 'tRNA', isCanonical: true, isSerineCdsHotspot: false, reason: 'tRNA/tmRNA/rRNA canonical attB neighborhood' };
+  if (/^tmrna$/i.test(type)) return { className: 'tmRNA', isCanonical: true, isSerineCdsHotspot: false, reason: 'tRNA/tmRNA/rRNA canonical attB neighborhood' };
+  if (/^rrna$/i.test(type)) return { className: 'rRNA', isCanonical: true, isSerineCdsHotspot: false, reason: 'rRNA neighborhood' };
+  if (!HOST_CDS_FEATURE_TYPES.has(type)) return { className: type || 'unknown', isCanonical: false, isSerineCdsHotspot: false, reason: '' };
+
+  if (/\b(groel1?|grol1?|cpn60|hsp60|chaperonin\s*60|60\s*kda\s+chaperonin|gro\s*el)\b/.test(text)) {
+    return { className: 'CDS_hotspot_groL_groEL', isCanonical: false, isSerineCdsHotspot: true, reason: 'serine-integrase CDS hotspot: groL/groEL/chaperonin 60' };
+  }
+  if (/\b(glutamyl\s*trna|glutamyl[-\s]trna|gln\s*trna|amidotransferase|gat[abc])\b/.test(text) &&
+      /\b(amidotransferase|glutamyl|gln|gat[abc])\b/.test(text)) {
+    return { className: 'CDS_hotspot_glutamyl_tRNA_amidotransferase', isCanonical: false, isSerineCdsHotspot: true, reason: 'reported serine-integrase/vector attB hotspot: glutamyl-tRNA amidotransferase-related CDS' };
+  }
+  return { className: 'CDS_other', isCanonical: false, isSerineCdsHotspot: false, reason: '' };
+}
+
+function isSerineCdsHotspot(featureOrMeta) {
+  return hostFeatureClassFromText(featureOrMeta).isSerineCdsHotspot;
+}
+
+function findIntegrases(record) {
+  /*
+    Conservative integrase/recombinase detector.
+
+    Important: do NOT score the words "serine" or "tyrosine" by themselves.
+    Those words are only meaningful here when they modify recombinase/integrase.
+    Otherwise annotations such as "serine/threonine protein kinase" are false positives.
+  */
+  const hardExclude = /\b(serine\s*[\/-]\s*threonine\s+protein\s+kinase|serine\s*[\/-]\s*threonine\s+kinase|protein\s+kinase|histidine\s+kinase|sensor\s+kinase|kinase|phosphatase)\b/i;
+
+  return record.features.filter(f => f.type === 'CDS' && f.start && f.end).map(f => {
+    const text = qualText(f);
+    const t = text.toLowerCase();
+    let score = 0;
+    const flags = [];
+
+    if (hardExclude.test(t)) {
+      return { feature: f, text, score: -999, excluded: true, reason: 'excluded kinase/phosphatase-like annotation' };
+    }
+
+    if (/\b(phage\s+)?integrase\b/.test(t)) {
+      score += 70;
+      flags.push('integrase');
+    }
+
+    // Common exact annotation for tyrosine-family phage integrases.
+    if (/\bsite[-\s]?specific\s+(integrase|recombinase)\b/.test(t)) {
+      score += 55;
+      flags.push('site-specific recombinase/integrase');
+    }
+
+    // Serine/tyrosine are evidence only when linked to recombinase/integrase/resolvase.
+    if (/\b(tyrosine|serine)[-\s]?(family\s+)?(site[-\s]?specific\s+)?(integrase|recombinase|resolvase)\b/.test(t) ||
+        /\b(integrase|recombinase|resolvase)[-\s]?(family\s+)?(tyrosine|serine)\b/.test(t)) {
+      score += 40;
+      flags.push('serine/tyrosine recombinase context');
+    }
+
+    // Generic recombinase is weaker evidence unless no better label exists.
+    if (/\brecombinase\b/.test(t)) {
+      score += 25;
+      flags.push('recombinase');
+    }
+
+    // A lone gene name "int" is useful but should not rescue unrelated products.
+    if (/((^|\s|;)gene\s+int(\s|$|;))|\bint\b/.test(t) && !/\bintergenic\b|\binterval\b/.test(t)) {
+      score += 35;
+      flags.push('int');
+    }
+
+    if (/\bresolvase\b|\binvertase\b/.test(t)) {
+      score += 15;
+      flags.push('resolvase/invertase');
+    }
+
+    // Penalize clearly non-integrase structural/packaging/mobile-element proteins.
+    if (/transposase|terminase|portal|capsid|tail|minor\s+tail|major\s+tail|coat\s+protein|head\s+protein/.test(t)) {
+      score -= 35;
+      flags.push('non-integrase penalty');
+    }
+    if (/hypothetical|unknown|uncharacterized/.test(t)) {
+      score -= 5;
+      flags.push('weak annotation penalty');
+    }
+
+    return { feature: f, text, score, flags, family: inferIntegraseFamily(text) };
+  }).filter(c => c.score > 0).sort((a,b) => b.score - a.score);
+}
+
+function extractWindow(seq, start1, end1, flank, circular) {
+  const n = seq.length;
+  const start0 = start1 - 1;
+  const end0 = end1;
+  let from = start0 - flank;
+  let to = end0 + flank;
+  if (!circular) {
+    from = clamp(from, 0, n);
+    to = clamp(to, 0, n);
+    return { seq: seq.slice(from, to), start: from + 1, end: to, wraps: false };
+  }
+  const len = to - from;
+  let out = '';
+  const chunks = [];
+  for (let i = 0; i < len; i += 10000) {
+    const partLen = Math.min(10000, len - i);
+    let part = '';
+    for (let x = 0; x < partLen; x++) part += seq[((from + i + x) % n + n) % n];
+    chunks.push(part);
+  }
+  out = chunks.join('');
+  return { seq: out, start: ((from % n + n) % n) + 1, end: ((to - 1) % n + n) % n + 1, wraps: from < 0 || to > n };
+}
+
+function findHostIntegrationFeatures(record, settings={}) {
+  const includeSerineCds = boolSetting(settings, 'serineHostSearch', true);
+  return record.features.filter(f => {
+    if (!f.start || !f.end) return false;
+    if (HOST_CORE_FEATURE_TYPES.has(f.type)) return true;
+    return includeSerineCds && HOST_CDS_FEATURE_TYPES.has(f.type) && isSerineCdsHotspot(f);
+  }).map((f, idx) => {
+    const product = f.qualifiers?.product || f.qualifiers?.gene || f.qualifiers?.note || f.qualifiers?.locus_tag || `${f.type}_${idx+1}`;
+    const label = Array.isArray(product) ? product.join('; ') : product;
+    const cls = hostFeatureClassFromText({ type: f.type, label });
+    return {
+      feature: f,
+      featureType: f.type,
+      featureClass: cls.className,
+      candidateReason: cls.reason,
+      product: label,
+      contigId: record.name || ''
+    };
+  });
+}
+
+// Backward-compatible alias used in a few log messages.
+function findTRNAs(record) { return findHostIntegrationFeatures(record); }
+
+function featureProduct(feature) {
+  if (!feature) return '';
+  if (feature.label || feature.product) return String(feature.label || feature.product || '');
+  const q = feature.qualifiers || {};
+  const val = q.product || q.gene || q.note || q.locus_tag || feature.type || '';
+  return Array.isArray(val) ? val.join('; ') : String(val || '');
+}
+
+function distanceToFeature(coreStart, coreEnd, featureStart, featureEnd) {
+  if (!Number.isFinite(coreStart) || !Number.isFinite(coreEnd) || !Number.isFinite(featureStart) || !Number.isFinite(featureEnd)) return null;
+  const a1 = Math.min(coreStart, coreEnd), a2 = Math.max(coreStart, coreEnd);
+  const b1 = Math.min(featureStart, featureEnd), b2 = Math.max(featureStart, featureEnd);
+  if (a2 >= b1 && b2 >= a1) return 0;
+  if (a2 < b1) return b1 - a2;
+  return a1 - b2;
+}
+
+function describeFeatureProximity(distance, featureType) {
+  if (distance === null || distance === undefined || !featureType) return 'unknown';
+  if (distance === 0) return `overlaps_${featureType}`;
+  if (distance <= 50) return `within_50bp_of_${featureType}`;
+  if (distance <= 250) return `within_250bp_of_${featureType}`;
+  if (distance <= 1000) return `within_1kb_of_${featureType}`;
+  return `not_near_${featureType}`;
+}
+
+function nearestIndexedFeature(target, hostCoord, bacterium) {
+  const direct = target.featureMeta || (target.feature ? {
+    type: target.feature.type,
+    label: featureProduct(target.feature),
+    start: target.feature.start,
+    end: target.feature.end,
+    strand: target.feature.strand || '',
+    contigId: target.contigId || bacterium.name || ''
+  } : null);
+
+  const candidates = [];
+  if (direct && direct.start && direct.end) candidates.push(direct);
+
+  const indexed = bacterium.hostIndex?.integrationFeatures || [];
+  for (const f of indexed) {
+    if (target.contigId && f.contigId && target.contigId !== f.contigId) continue;
+    candidates.push(f);
+  }
+
+  // For directly uploaded small host GenBank records, global hits can still be
+  // annotated against parsed tRNA/tmRNA/rRNA features from the same record.
+  if (!indexed.length && Array.isArray(bacterium.features)) {
+    for (const f of bacterium.features) {
+      if (!f.start || !f.end) continue;
+      if (!HOST_CORE_FEATURE_TYPES.has(f.type || '') && !isSerineCdsHotspot(f)) continue;
+      const cls = hostFeatureClassFromText({ type: f.type, label: featureProduct(f) });
+      candidates.push({
+        type: f.type,
+        label: featureProduct(f),
+        featureClass: cls.className,
+        candidateReason: cls.reason,
+        start: f.start,
+        end: f.end,
+        strand: f.strand || '',
+        contigId: bacterium.name || ''
+      });
+    }
+  }
+
+  let best = null;
+  for (const f of candidates) {
+    const d = distanceToFeature(hostCoord.start, hostCoord.end, Number(f.start), Number(f.end));
+    if (d === null) continue;
+    if (!best || d < best.distanceBp) best = { ...f, distanceBp: d };
+  }
+  return best;
+}
+
+function kmerIndex(seq, k) {
+  const idx = new Map();
+  for (let i = 0; i <= seq.length - k; i++) {
+    const kmer = seq.slice(i, i + k);
+    if (kmer.includes('N') || isLowComplexity(kmer)) continue;
+    let arr = idx.get(kmer);
+    if (!arr) { arr = []; idx.set(kmer, arr); }
+    if (arr.length < 250) arr.push(i);
+  }
+  return idx;
+}
+
+function bestExactCoreFromIndex(querySeq, qIndex, targetSeq, k, minCore) {
+  if (querySeq.length < k || targetSeq.length < k) return null;
+  let best = null;
+  let seedHits = 0;
+  for (let j = 0; j <= targetSeq.length - k; j++) {
+    const kmer = targetSeq.slice(j, j + k);
+    if (isLowComplexity(kmer)) continue;
+    const qs = qIndex.get(kmer);
+    if (!qs) continue;
+    for (const i of qs) {
+      seedHits++;
+      let l = 0;
+      while (i - l - 1 >= 0 && j - l - 1 >= 0 && querySeq[i-l-1] === targetSeq[j-l-1]) l++;
+      let r = k;
+      while (i + r < querySeq.length && j + r < targetSeq.length && querySeq[i+r] === targetSeq[j+r]) r++;
+      const len = l + r;
+      const coreSeq = querySeq.slice(i - l, i + r);
+      if (!isLowComplexity(coreSeq) && (!best || len > best.len)) {
+        best = { len, qStart: i - l, qEnd: i + r, tStart: j - l, tEnd: j + r, seq: coreSeq, seedHits };
+      }
+    }
+  }
+  if (!best || best.len < minCore) return null;
+  best.seedHits = seedHits;
+  return best;
+}
+
+
+function stemEvidence(seq, coreStart, coreEnd, settings) {
+  const minMatches = numericSetting(settings, 'serineStemMatches', 5, 3, 12);
+  const minArm = Math.max(5, minMatches);
+  const maxArm = numericSetting(settings, 'serineStemArmMax', 12, minArm, 20);
+  let best = null;
+  for (let arm = minArm; arm <= maxArm; arm++) {
+    if (coreStart - arm < 0 || coreEnd + arm > seq.length) continue;
+    const left = seq.slice(coreStart - arm, coreStart);
+    const right = seq.slice(coreEnd, coreEnd + arm);
+    const rightRC = rc(right);
+    let matches = 0;
+    for (let i = 0; i < arm; i++) if (left[i] === rightRC[i]) matches++;
+    const identity = matches / arm;
+    if (matches < minMatches || identity < 0.78) continue;
+    const evidence = { armLength: arm, matches, identity, leftFlank: left, rightFlank: right, rightFlankRC: rightRC };
+    if (!best || evidence.matches > best.matches || (evidence.matches === best.matches && evidence.identity > best.identity)) best = evidence;
+  }
+  return best;
+}
+
+function bestSerineStemCoreFromIndex(querySeq, targetSeq, k, settings) {
+  const qIndex = kmerIndex(querySeq, k);
+  const maxCore = numericSetting(settings, 'serineCoreMax', 14, k, 30);
+  let best = null;
+  let seedHits = 0;
+  if (querySeq.length < k || targetSeq.length < k) return null;
+  for (let j = 0; j <= targetSeq.length - k; j++) {
+    const kmer = targetSeq.slice(j, j + k);
+    if (isLowComplexity(kmer)) continue;
+    const qs = qIndex.get(kmer);
+    if (!qs) continue;
+    for (const i of qs) {
+      seedHits++;
+      let l = 0;
+      while (i - l - 1 >= 0 && j - l - 1 >= 0 && querySeq[i-l-1] === targetSeq[j-l-1] && (l + k) < maxCore) l++;
+      let r = k;
+      while (i + r < querySeq.length && j + r < targetSeq.length && querySeq[i+r] === targetSeq[j+r] && (l + r) < maxCore) r++;
+      const len = l + r;
+      const qStart = i - l, qEnd = i + r, tStart = j - l, tEnd = j + r;
+      if (isLowComplexity(querySeq.slice(qStart, qEnd))) continue;
+      const qStem = stemEvidence(querySeq, qStart, qEnd, settings);
+      if (!qStem) continue;
+      const tStem = stemEvidence(targetSeq, tStart, tEnd, settings);
+      if (!tStem) continue;
+      const combined = qStem.matches + tStem.matches + (qStem.identity + tStem.identity) * 3 + len;
+      const core = {
+        len, qStart, qEnd, tStart, tEnd,
+        seq: querySeq.slice(qStart, qEnd),
+        seedHits,
+        matchModel: 'serine_stem_core',
+        queryStem: qStem,
+        targetStem: tStem,
+        stemScoreRaw: combined
+      };
+      if (!best || combined > best.stemScoreRaw || (combined === best.stemScoreRaw && len > best.len)) best = core;
+    }
+  }
+  if (!best) return null;
+  best.seedHits = seedHits;
+  return best;
+}
+
+function describeStem(stem) {
+  if (!stem) return 'no stem evidence';
+  return `${stem.leftFlank}|core|${stem.rightFlank} (${stem.matches}/${stem.armLength} bp inverted-complement arm match)`;
+}
+
+function describeSerineEvidence(core) {
+  if (!core || core.matchModel !== 'serine_stem_core') return '';
+  return `small shared core with paired-arm support; phage ${describeStem(core.queryStem)}; host ${describeStem(core.targetStem)}`;
+}
+
+function regionCandidatesByKmers(qIndex, genomeSeq, k, maxCandidates) {
+  if (maxCandidates <= 0) return [];
+  const bins = new Map();
+  const binSize = 1000;
+  for (let j = 0; j <= genomeSeq.length - k; j++) {
+    const kmer = genomeSeq.slice(j, j + k);
+    if (!qIndex.has(kmer)) continue;
+    const bin = Math.floor(j / binSize);
+    bins.set(bin, (bins.get(bin) || 0) + 1);
+  }
+  return [...bins.entries()]
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, maxCandidates)
+    .map(([bin, count]) => ({ start0: Math.max(0, bin*binSize - 1000), end0: Math.min(genomeSeq.length, (bin+1)*binSize + 1000), count }));
+}
+
+function scoreHit(core, opts, settings={}) {
+  const model = core.matchModel || 'exact_core';
+  const featureClass = opts.hostFeatureClass || '';
+  const integraseFamily = opts.integraseFamily || 'unknown';
+  const seedScore = Math.min(model === 'serine_stem_core' ? 8 : 18, Math.log2((core.seedHits || 0) + 1) * (model === 'serine_stem_core' ? 2.2 : 4));
+  const canonicalFeature = isCanonicalHostFeatureClass(featureClass, opts.searchType);
+  let featureScore = canonicalFeature ? 10 : 0;
+  if (featureClass === 'CDS_hotspot_groL_groEL') featureScore = 16;
+  else if (featureClass === 'CDS_hotspot_glutamyl_tRNA_amidotransferase') featureScore = 12;
+  else if (opts.searchType === 'indexed_feature') featureScore = Math.max(featureScore, 6);
+
+  let familyScore = 0;
+  if (integraseFamily === 'serine') {
+    if (isSerineCdsHostFeatureClass(featureClass, opts.searchType)) familyScore += 14;
+    if (model === 'serine_stem_core') familyScore += 8;
+    if (canonicalFeature) familyScore -= 18;
+  } else if (integraseFamily === 'tyrosine') {
+    if (canonicalFeature) familyScore += 12;
+    if (isSerineCdsHostFeatureClass(featureClass, opts.searchType)) familyScore -= 14;
+    if (model === 'serine_stem_core') familyScore -= 10;
+  }
+
+  const assessment = assessFamilyModelFit(core, { ...opts, integraseFamily, hostFeatureClass: featureClass }, settings);
+  const modelFitScore = assessment.fit === 'on_model' ? 6 : assessment.fit === 'off_model_rescued' ? -6 : assessment.fit === 'off_model' ? -28 : 0;
+  const repeatPenalty = (core.seedHits || 0) > (model === 'serine_stem_core' ? 1200 : 300) ? -10 : 0;
+
+  if (model === 'serine_stem_core') {
+    const qStem = core.queryStem || { matches: 0, identity: 0 };
+    const tStem = core.targetStem || { matches: 0, identity: 0 };
+    const coreScore = Math.min(34, core.len * 4.0);
+    const stemScore = Math.min(34, (qStem.matches + tStem.matches) * 2.0 + (qStem.identity + tStem.identity) * 5.0);
+    return Math.max(0, Math.min(100, Math.round(coreScore + stemScore + seedScore + featureScore + familyScore + modelFitScore + repeatPenalty)));
+  }
+
+  const coreScore = Math.min(70, core.len * 2.2);
+  return Math.max(0, Math.min(100, Math.round(coreScore + seedScore + featureScore + familyScore + modelFitScore + repeatPenalty)));
+}
+
+function coordFromWindow(window, offset0, len, genomeLength) {
+  const s0 = (window.absoluteStart0 + offset0) % genomeLength;
+  const e0 = (s0 + len - 1) % genomeLength;
+  return { start: s0 + 1, end: e0 + 1, wraps: s0 + len > genomeLength };
+}
+
+function makeCandidateTarget(record, start1, end1, flank, circular, label, feature=null) {
+  const w = extractWindow(record.sequence, start1, end1, flank, circular);
+  const start0 = w.start - 1;
+  return {
+    ...w,
+    absoluteStart0: start0,
+    label,
+    feature,
+    featureMeta: feature ? {
+      type: feature.type || '',
+      label: featureProduct(feature),
+      start: feature.start,
+      end: feature.end,
+      strand: feature.strand || '',
+      contigId: record.name || ''
+    } : null,
+    contigId: record.name || '',
+    contigLength: record.sequence.length
+  };
+}
+
+async function readFiles(fileList, role) {
+  const parsed = [];
+  for (const file of fileList) {
+    postLog(`Reading ${role} file ${file.name} (${fmtBytes(file.size)})…`);
+    const text = await file.text();
+    const looksLikeHostIndex = role === 'host' && (file.name.toLowerCase().endsWith('.json') || text.trim().startsWith('{'));
+    let recs;
+    if (looksLikeHostIndex) {
+      recs = [parseHostIndex(text, file.name)];
+    } else {
+      const isGB = /^LOCUS\s/m.test(text) || /\nFEATURES\s+Location\/Qualifiers/.test(text);
+      recs = isGB ? parseGenBank(text, file.name, role) : parseFasta(text, file.name);
+    }
+    for (const r of recs) parsed.push(r);
+    postLog(`Parsed ${recs.length} record(s) from ${file.name}.`);
+  }
+  return parsed;
+}
+
+function parseHostIndex(text, fileName) {
+  let idx;
+  try { idx = JSON.parse(text); }
+  catch (e) { throw new Error(`${fileName} is not valid JSON: ${e.message}`); }
+  if (!idx || idx.schema !== 'att-site-host-index-v1') {
+    throw new Error(`${fileName} does not look like an att-site-host-index-v1 file. Rebuild it with the included tools/build_host_index_interactive.py script.`);
+  }
+  const metadata = idx.metadata || {};
+  const summary = idx.summary || {};
+  const contigs = new Map((idx.contigs || []).map(c => [c.id, c]));
+
+  const integrationFeatures = (idx.feature_neighborhoods || []).map((n, i) => ({
+    id: n.id || `indexed_feature_${i+1}`,
+    type: n.feature_type || 'feature',
+    label: n.feature_label || n.product || 'unlabeled',
+    start: Number(n.feature_start || n.start || 0),
+    end: Number(n.feature_end || n.end || 0),
+    strand: String(n.feature_strand || ''),
+    contigId: n.contig_id || '',
+    featureClass: hostFeatureClassFromText({ type: n.feature_type || 'feature', label: n.feature_label || n.product || 'unlabeled' }).className,
+    candidateReason: n.candidate_reason || hostFeatureClassFromText({ type: n.feature_type || 'feature', label: n.feature_label || n.product || 'unlabeled' }).reason,
+    windowStart: Number(n.window_start_approx || 0),
+    windowEnd: Number(n.window_end_approx || 0)
+  })).filter(f => f.start && f.end);
+
+  const featureNeighborhoods = (idx.feature_neighborhoods || []).filter(n => n.sequence).map((n, i) => {
+    const contig = contigs.get(n.contig_id) || {};
+    const start = Number(n.window_start_approx || 1);
+    const end = Number(n.window_end_approx || start + (n.sequence || '').length - 1);
+    const meta = integrationFeatures.find(f => f.id === (n.id || `indexed_feature_${i+1}`)) || {
+      type: n.feature_type || 'feature',
+      label: n.feature_label || 'unlabeled',
+      start: Number(n.feature_start || 0),
+      end: Number(n.feature_end || 0),
+      strand: String(n.feature_strand || ''),
+      contigId: n.contig_id || '',
+      featureClass: hostFeatureClassFromText({ type: n.feature_type || 'feature', label: n.feature_label || n.product || 'unlabeled' }).className,
+      candidateReason: n.candidate_reason || hostFeatureClassFromText({ type: n.feature_type || 'feature', label: n.feature_label || n.product || 'unlabeled' }).reason
+    };
+    return {
+      seq: cleanSeq(n.sequence),
+      absoluteStart0: Math.max(0, start - 1),
+      start,
+      end,
+      wraps: !!n.window_is_circular_wrapped,
+      label: `${n.feature_type || 'feature'} ${n.feature_start || ''}..${n.feature_end || ''} on ${n.contig_id || 'contig'} (${n.feature_label || 'unlabeled'})`,
+      feature: null,
+      featureMeta: meta,
+      product: n.feature_label || '',
+      contigId: n.contig_id || '',
+      contigLength: Number(contig.length || summary.total_bp || (n.sequence || '').length)
+    };
+  });
+  const globalChunks = (idx.global_chunks || []).filter(c => c.sequence).map((c) => {
+    const contig = contigs.get(c.contig_id) || {};
+    return {
+      seq: cleanSeq(c.sequence),
+      absoluteStart0: Math.max(0, Number(c.start || 1) - 1),
+      start: Number(c.start || 1),
+      end: Number(c.end || (c.sequence || '').length),
+      wraps: false,
+      label: `indexed global chunk ${c.start || '?'}..${c.end || '?'} on ${c.contig_id || 'contig'}`,
+      feature: null,
+      featureMeta: null,
+      product: '',
+      contigId: c.contig_id || '',
+      contigLength: Number(contig.length || summary.total_bp || (c.sequence || '').length)
+    };
+  });
+  if (!featureNeighborhoods.length) postLog(`${fileName}: host index contains no sequence-bearing feature neighborhoods.`);
+  if ((idx.global_chunks || []).length && !globalChunks.length) postLog(`${fileName}: global chunks are present but lack sequences, so broad search cannot use this index. Rebuild without --omit-global-sequences if broad browser search is desired.`);
+  return {
+    name: metadata.name || metadata.organism || fileName,
+    fileName,
+    sequence: '',
+    sequenceLength: Number(summary.total_bp || 0),
+    features: [],
+    format: 'HostIndex',
+    hostIndex: { featureNeighborhoods, globalChunks, integrationFeatures, parameters: idx.parameters || {}, contigs: idx.contigs || [], summary }
+  };
+}
+
+function countKmerSupport(qIndex, targetSeq, k) {
+  let count = 0;
+  for (let j = 0; j <= targetSeq.length - k; j++) {
+    const kmer = targetSeq.slice(j, j + k);
+    if (qIndex.has(kmer)) count++;
+  }
+  return count;
+}
+
+
+function getPhageSearchRegions(phage, settings) {
+  const integrases = findIntegrases(phage);
+  if (integrases.length) {
+    return integrases.slice(0, 3).map(intHit => {
+      const intF = intHit.feature;
+      const pWin = extractWindow(phage.sequence, intF.start, intF.end, settings.intFlank, settings.circular);
+      return {
+        intHit,
+        intF,
+        intName: intHit.text || `${intF.start}..${intF.end}`,
+        pWin,
+        mode: 'integrase_window',
+        integraseFamily: intHit.family || inferIntegraseFamily(intHit.text)
+      };
+    });
+  }
+
+  // Multi-record phage FASTA support. FASTA has no annotation, so each FASTA
+  // record is treated as one phage query sequence and searched as a whole phage.
+  // This is less specific than an integrase-centered GenBank search, but it lets
+  // users screen many phage genomes supplied as one FASTA file.
+  if (phage.format === 'FASTA' && phage.sequence && phage.sequence.length >= settings.k) {
+    return [{
+      intHit: null,
+      intF: { start: 1, end: phage.sequence.length, strand: '+', qualifiers: {} },
+      intName: 'FASTA whole-phage query; no integrase annotation',
+      pWin: { seq: phage.sequence, start: 1, end: phage.sequence.length, wraps: false },
+      mode: 'whole_fasta_phage',
+      integraseFamily: 'unknown'
+    }];
+  }
+
+  return [];
+}
+
+function analyzePair(phage, bacterium, settings) {
+  const outputs = [];
+  const phageSearchRegions = getPhageSearchRegions(phage, settings);
+  if (!phageSearchRegions.length) {
+    postLog(`No integrase-like CDS found in phage ${phage.name}; skipping this phage. If this is FASTA, check that it contains DNA sequence records.`);
+    return outputs;
+  }
+  if (phage.format === 'FASTA') {
+    postLog(`Phage FASTA record ${phage.name}: using whole sequence as query because FASTA has no integrase annotation.`);
+  }
+
+  const usingHostIndex = bacterium.format === 'HostIndex';
+  const integrationFeatures = usingHostIndex ? [] : findHostIntegrationFeatures(bacterium, settings);
+  if (usingHostIndex) {
+    const nFeat = bacterium.hostIndex.featureNeighborhoods.length;
+    const nGlob = bacterium.hostIndex.globalChunks.length;
+    postLog(`${bacterium.name} is a host_index.json: ${nFeat} indexed feature neighborhood(s), ${nGlob} sequence-bearing global chunk(s).`);
+  } else {
+    if (!integrationFeatures.length && bacterium.format === 'GenBank') postLog(`No tRNA/tmRNA/rRNA or serine-CDS-hotspot features found in ${bacterium.name}; global search only.`);
+    if (bacterium.format === 'FASTA') postLog(`${bacterium.name} is FASTA; tRNA-first search unavailable.`);
+  }
+
+  for (const queryRegion of phageSearchRegions) {
+    const { intF, intName, pWin, mode } = queryRegion;
+    const integraseFamilyInferred = queryRegion.integraseFamily || 'unknown';
+    const integraseFamily = effectiveIntegraseFamily(integraseFamilyInferred, settings);
+    const integraseFamilySource = effectiveIntegraseFamilySource(integraseFamilyInferred, settings);
+    postLog(`Integrase-family setting for ${phage.name}: ${integraseFamily} (${integraseFamilySource}; annotation/inference: ${integraseFamilyInferred}).`);
+    const pSeqPlus = pWin.seq;
+    const pSeqMinus = rc(pWin.seq);
+    const pPlusIndex = kmerIndex(pSeqPlus, settings.k);
+    const pMinusIndex = kmerIndex(pSeqMinus, settings.k);
+    const stemK = boolSetting(settings, 'serineStemSearch', true) ? Math.min(numericSetting(settings, 'serineCoreMin', 8, 6, 14), pSeqPlus.length) : 0;
+    const pStemIndex = stemK >= 6 ? kmerIndex(pSeqPlus, stemK) : null;
+
+    if (usingHostIndex) {
+      const allTargets = bacterium.hostIndex.featureNeighborhoods;
+      const targets = allTargets.filter(target => shouldSearchFeatureTarget(target, settings, integraseFamily));
+      const skipped = allTargets.length - targets.length;
+      const skipNote = skipped ? `; skipped ${skipped} off-model feature neighborhood(s) for ${integraseFamily} integrase setting` : '';
+      postLog(`Testing ${targets.length} indexed host feature neighborhood(s) for ${bacterium.name} against ${phage.name}${skipNote}.`);
+      for (const target of targets) {
+        evaluateTarget({ outputs, phage, bacterium, intF, intName, pWin, pSeqPlus, pSeqMinus, pPlusIndex, pMinusIndex, target, searchType: 'indexed_feature', product: target.product || '', settings, queryMode: mode, integraseFamily, integraseFamilyInferred, integraseFamilySource });
+      }
+      if (settings.globalSearch) {
+        const chunks = bacterium.hostIndex.globalChunks;
+        if (!chunks.length) {
+          postLog(`No sequence-bearing global chunks available in ${bacterium.fileName}; skipping broad search. Rebuild host_index.json with broader chunks enabled if needed.`);
+        } else {
+          postLog(`Ranking ${chunks.length} indexed global chunk(s); testing top ${settings.maxGlobal}.`);
+          const ranked = chunks.map(ch => {
+              const support = countKmerSupport(pPlusIndex, ch.seq, settings.k);
+              const smallSupport = pStemIndex ? countKmerSupport(pStemIndex, ch.seq, stemK) : 0;
+              return { target: ch, support, smallSupport, combinedSupport: support * 100 + smallSupport };
+            })
+            .filter(x => x.support > 0 || x.smallSupport > 0)
+            .sort((a,b) => b.combinedSupport - a.combinedSupport)
+            .slice(0, settings.maxGlobal);
+          for (const { target, support, smallSupport } of ranked) {
+            const t = { ...target, label: `${target.label}; k-mer support ${support}; small-core support ${smallSupport}` };
+            evaluateTarget({ outputs, phage, bacterium, intF, intName, pWin, pSeqPlus, pSeqMinus, pPlusIndex, pMinusIndex, target: t, searchType: 'indexed_global', product: '', settings, queryMode: mode, integraseFamily, integraseFamilyInferred, integraseFamilySource });
+          }
+        }
+      }
+      continue;
+    }
+
+    const candidateFeatureTargets = integrationFeatures.filter(hostFeature => shouldSearchFeatureTarget(hostFeature, settings, integraseFamily));
+    const skippedFeatureTargets = integrationFeatures.length - candidateFeatureTargets.length;
+    const skipFeatureNote = skippedFeatureTargets ? `; skipped ${skippedFeatureTargets} off-model feature region(s) for ${integraseFamily} integrase setting` : '';
+    postLog(`Testing ${candidateFeatureTargets.length} attB-priority feature region(s) for ${bacterium.name} against ${phage.name}${skipFeatureNote}.`);
+    for (const hostFeature of candidateFeatureTargets) {
+      const tF = hostFeature.feature;
+      const target = makeCandidateTarget(bacterium, tF.start, tF.end, settings.trnaFlank, settings.circular, `near ${hostFeature.product}`, tF);
+      target.product = hostFeature.product;
+      target.featureMeta = { type: hostFeature.featureType, label: hostFeature.product, featureClass: hostFeature.featureClass, candidateReason: hostFeature.candidateReason, start: tF.start, end: tF.end, strand: tF.strand || '', contigId: bacterium.name || '' };
+      target.contigLength = bacterium.sequence.length;
+      const searchKind = HOST_CORE_FEATURE_TYPES.has(hostFeature.featureType) ? hostFeature.featureType : 'CDS_hotspot';
+      evaluateTarget({ outputs, phage, bacterium, intF, intName, pWin, pSeqPlus, pSeqMinus, pPlusIndex, pMinusIndex, target, searchType: searchKind, product: hostFeature.product, settings, queryMode: mode, integraseFamily, integraseFamilyInferred, integraseFamilySource });
+    }
+
+    if (settings.globalSearch) {
+      postLog(`Running broader k-mer scan for ${bacterium.name} (${fmt(bacterium.sequence.length)} bp); max ${settings.maxGlobal} candidate bins.`);
+      const regionMap = new Map();
+      for (const region of regionCandidatesByKmers(pPlusIndex, bacterium.sequence, settings.k, settings.maxGlobal)) {
+        regionMap.set(`${region.start0}-${region.end0}`, { ...region, exactSupport: region.count, smallSupport: 0 });
+      }
+      if (pStemIndex) {
+        for (const region of regionCandidatesByKmers(pStemIndex, bacterium.sequence, stemK, settings.maxGlobal * 3)) {
+          const key = `${region.start0}-${region.end0}`;
+          const prior = regionMap.get(key) || { ...region, exactSupport: 0, smallSupport: 0 };
+          prior.smallSupport = Math.max(prior.smallSupport || 0, region.count || 0);
+          regionMap.set(key, prior);
+        }
+      }
+      const globalRegions = [...regionMap.values()]
+        .sort((a,b) => ((b.exactSupport || 0) * 100 + (b.smallSupport || 0)) - ((a.exactSupport || 0) * 100 + (a.smallSupport || 0)))
+        .slice(0, settings.maxGlobal);
+      for (const region of globalRegions) {
+        const target = { seq: bacterium.sequence.slice(region.start0, region.end0), absoluteStart0: region.start0, start: region.start0 + 1, end: region.end0, wraps: false, label: `global bin support ${region.exactSupport || region.count || 0}; small-core support ${region.smallSupport || 0}`, feature: null, contigLength: bacterium.sequence.length };
+        evaluateTarget({ outputs, phage, bacterium, intF, intName, pWin, pSeqPlus, pSeqMinus, pPlusIndex, pMinusIndex, target, searchType: 'global', product: '', settings, queryMode: mode, integraseFamily, integraseFamilyInferred, integraseFamilySource });
+      }
+    }
+  }
+  return outputs;
+}
+
+
+function evaluateTarget(ctx) {
+  const { outputs, phage, bacterium, intF, intName, pWin, pSeqPlus, pSeqMinus, pPlusIndex, pMinusIndex, target, searchType, product, settings, queryMode, integraseFamily, integraseFamilyInferred, integraseFamilySource } = ctx;
+  const rcTarget = rc(target.seq);
+  const targetFeatureClassInfo = hostFeatureClassFromText(target.featureMeta || target.feature || { type: searchType, label: product || target.product || target.label || '' });
+  const hostFeatureClass = target.featureMeta?.featureClass || targetFeatureClassInfo.className || searchType;
+  const tests = [
+    { strand: '+', qSeq: pSeqPlus, qIndex: pPlusIndex, targetSeq: target.seq, queryReverse: false, targetReverse: false },
+    { strand: '-', qSeq: pSeqPlus, qIndex: pPlusIndex, targetSeq: rcTarget, queryReverse: false, targetReverse: true },
+    { strand: '+ vs phageRC', qSeq: pSeqMinus, qIndex: pMinusIndex, targetSeq: target.seq, queryReverse: true, targetReverse: false }
+  ];
+  let best = null;
+  const consider = (core, t) => {
+    if (!core) return;
+    core.matchModel = core.matchModel || 'exact_core';
+    const score = scoreHit(core, { searchType, hostFeatureClass, integraseFamily }, settings);
+    const candidate = { core, score, ...t };
+    if (!best || candidate.score > best.score || (candidate.score === best.score && candidate.core.len > best.core.len)) best = candidate;
+  };
+
+  for (const t of tests) {
+    const exact = bestExactCoreFromIndex(t.qSeq, t.qIndex, t.targetSeq, settings.k, settings.minCore);
+    if (exact) exact.matchModel = 'exact_core';
+    consider(exact, t);
+
+    if (boolSetting(settings, 'serineStemSearch', true)) {
+      const stemK = Math.min(numericSetting(settings, 'serineCoreMin', 8, 6, 14), t.qSeq.length, t.targetSeq.length);
+      if (stemK >= 6) {
+        const stemCore = bestSerineStemCoreFromIndex(t.qSeq, t.targetSeq, stemK, settings);
+        consider(stemCore, t);
+      }
+    }
+  }
+  if (!best) return;
+
+  const hostStart0 = best.targetReverse ? (target.seq.length - best.core.tEnd) : best.core.tStart;
+  const hostLength = Number(target.contigLength || bacterium.sequence?.length || bacterium.sequenceLength || target.seq.length);
+  const hostCoord = coordFromWindow(target, hostStart0, best.core.len, hostLength);
+  const phageOffset0 = best.queryReverse ? (pSeqPlus.length - best.core.qEnd) : best.core.qStart;
+  const phageCoord = coordFromWindow({ absoluteStart0: pWin.start - 1 }, phageOffset0, best.core.len, phage.sequence.length);
+  const nearestFeature = nearestIndexedFeature(target, hostCoord, bacterium);
+  const featureDistance = nearestFeature ? nearestFeature.distanceBp : null;
+  const featureType = nearestFeature?.type || target.featureMeta?.type || '';
+  const featureLabel = nearestFeature?.label || target.featureMeta?.label || '';
+  const nearestClassInfo = nearestFeature ? hostFeatureClassFromText(nearestFeature) : targetFeatureClassInfo;
+  const featureClass = target.featureMeta?.featureClass || nearestFeature?.featureClass || nearestClassInfo.className || hostFeatureClass;
+  const candidateReason = target.featureMeta?.candidateReason || nearestFeature?.candidateReason || nearestClassInfo.reason || '';
+  const featureCoords = nearestFeature ? `${nearestFeature.contigId || target.contigId || 'contig'}:${nearestFeature.start}..${nearestFeature.end}${nearestFeature.strand ? ` (${nearestFeature.strand})` : ''}` : '';
+  const featureProximity = nearestFeature ? describeFeatureProximity(featureDistance, featureType) : (searchType === 'global' || searchType === 'indexed_global' ? 'not_near_indexed_feature_or_unknown' : 'unknown');
+  const finalAssessment = assessFamilyModelFit(best.core, { searchType, hostFeatureClass: featureClass, integraseFamily }, settings);
+  if (finalAssessment.offModel && !boolSetting(settings, 'showOffModelCandidates', false)) return;
+  outputs.push({
+    score: best.score,
+    phage: phage.name,
+    phageFile: phage.fileName,
+    host: bacterium.name,
+    hostFile: bacterium.fileName,
+    integrase: intName,
+    integraseFamily: integraseFamily || 'unknown',
+    integraseFamilyInferred: integraseFamilyInferred || 'unknown',
+    integraseFamilySource: integraseFamilySource || 'auto_unresolved',
+    modelFit: finalAssessment.fit,
+    modelFitReason: finalAssessment.reason,
+    integraseCoords: queryMode === 'whole_fasta_phage' ? `whole FASTA record 1..${phage.sequence.length}` : `${intF.start}..${intF.end} (${intF.strand})`,
+    queryMode: queryMode || 'integrase_window',
+    matchModel: best.core.matchModel || 'exact_core',
+    serineEvidence: describeSerineEvidence(best.core),
+    hostFeatureClass: featureClass,
+    candidateReason,
+    searchType,
+    hostLocus: target.label,
+    strand: best.strand,
+    product,
+    nearestFeatureType: featureType,
+    nearestFeatureLabel: featureLabel,
+    nearestFeatureCoords: featureCoords,
+    distanceToFeatureBp: featureDistance,
+    featureProximity,
+    hostContig: target.contigId || bacterium.name || '',
+    phageLength: phage.sequence.length,
+    hostLength,
+    coreLength: best.core.len,
+    coreSequence: best.core.seq,
+    seedHits: best.core.seedHits,
+    phageCore: `${phageCoord.start}..${phageCoord.end}${phageCoord.wraps ? ' (wraps)' : ''}`,
+    hostCore: `${hostCoord.start}..${hostCoord.end}${hostCoord.wraps ? ' (wraps)' : ''}`,
+    phageWindow: `${pWin.start}..${pWin.end}${pWin.wraps ? ' (wraps)' : ''}`,
+    hostWindow: `${target.start}..${target.end}${target.wraps ? ' (wraps)' : ''}`
+  });
+}
+
+function normalizeCoordForDedupe(coord) {
+  return String(coord || '')
+    .replace(/\s*\(wraps\)\s*/g, '')
+    .replace(/\s+/g, '');
+}
+
+function mergeSearchTypes(a, b) {
+  const parts = new Set();
+  for (const value of [a, b]) {
+    String(value || '')
+      .split(/[+,]/)
+      .map(x => x.trim())
+      .filter(Boolean)
+      .forEach(x => parts.add(x));
+  }
+  return [...parts].join(' + ');
+}
+
+function betterDuplicateRepresentative(candidate, incumbent) {
+  if (!incumbent) return candidate;
+  if (candidate.score !== incumbent.score) return candidate.score > incumbent.score ? candidate : incumbent;
+  if (candidate.coreLength !== incumbent.coreLength) return candidate.coreLength > incumbent.coreLength ? candidate : incumbent;
+  if ((candidate.seedHits || 0) !== (incumbent.seedHits || 0)) return (candidate.seedHits || 0) > (incumbent.seedHits || 0) ? candidate : incumbent;
+
+  // Prefer biologically focused feature-neighborhood hits over broad indexed/global hits
+  // when the exact core and coordinates are otherwise identical.
+  const priority = { tRNA: 6, tmRNA: 6, rRNA: 5, CDS_hotspot: 5, indexed_feature: 4, indexed_global: 2, global: 1 };
+  const candidatePriority = priority[candidate.searchType] || 0;
+  const incumbentPriority = priority[incumbent.searchType] || 0;
+  return candidatePriority > incumbentPriority ? candidate : incumbent;
+}
+
+function dedupeResults(results) {
+  const seen = new Map();
+  for (const r of results) {
+    // Exact biological duplicate: same phage, same host, same core sequence, same
+    // phage coordinates, and same host coordinates. Do NOT include searchType here,
+    // because the same candidate can be discovered through a tRNA/indexed-feature
+    // neighborhood and again through overlapping global chunks.
+    const key = [
+      r.phageFile || r.phage,
+      r.hostFile || r.host,
+      r.coreSequence,
+      normalizeCoordForDedupe(r.phageCore),
+      normalizeCoordForDedupe(r.hostCore)
+    ].join('|');
+
+    const previous = seen.get(key);
+    const best = betterDuplicateRepresentative(r, previous);
+    const duplicateCount = (previous?.duplicateCount || 1) + (previous ? 1 : 0);
+    const searchType = mergeSearchTypes(previous?.searchType, r.searchType);
+    const searchSources = [...new Set([...(previous?.searchSources || []), r.searchType].filter(Boolean))];
+
+    seen.set(key, {
+      ...best,
+      searchType,
+      searchSources,
+      duplicateCount: previous ? duplicateCount : 1
+    });
+  }
+  return [...seen.values()].sort((a,b) => b.score - a.score || b.coreLength - a.coreLength);
+}
+
+async function run(payload) {
+  const settings = payload.settings;
+  postLog('Parsing phage files in full annotation mode…');
+  const phages = await readFiles(payload.phageFiles, 'phage');
+  postLog('Parsing bacterial inputs. host_index.json files are used directly; GenBank files are parsed in host-optimized mode…');
+  const bacteria = await readFiles(payload.bactFiles, 'host');
+  postLog(`Parsed ${phages.length} phage record(s) and ${bacteria.length} bacterial record(s).`);
+
+  const all = [];
+  for (const p of phages) {
+    postLog(`Phage ${p.name}: ${fmt(p.sequence.length)} bp, ${p.features.length} parsed feature(s).`);
+    for (const b of bacteria) {
+      if (b.format === 'HostIndex') postLog(`Comparing ${p.name} to ${b.name}: indexed host, ${fmt(b.sequenceLength || 0)} total bp.`);
+      else postLog(`Comparing ${p.name} to ${b.name}: ${fmt(b.sequence.length)} bp, ${findHostIntegrationFeatures(b, settings).length} parsed attB-priority feature(s).`);
+      all.push(...analyzePair(p, b, settings));
+    }
+  }
+  const results = dedupeResults(all);
+  self.postMessage({ type: 'results', results });
+  self.postMessage({ type: 'done' });
+}
+
+self.onmessage = (event) => {
+  const msg = event.data || {};
+  if (msg.type !== 'run') return;
+  run(msg).catch(err => self.postMessage({ type: 'error', message: err?.stack || err?.message || String(err) }));
+};
